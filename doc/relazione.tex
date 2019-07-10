@@ -1,0 +1,322 @@
+\documentclass[12pt]{article}
+\usepackage[italian]{babel}
+\begin{document}
+\title{Sistema di simulazione reti logiche - relazione}
+\maketitle
+
+\section{Abstract}
+
+Questa relazione documenta in dettaglio la progettazione e
+l'implementazione di un sistema di simulazione di reti logiche secondo
+le specifiche del corso Algoritmi e Calcolatori (01MNNNX), A.A.
+2018/2019.
+
+Il problema richiede di leggere da file la rappresentazione di un
+circuito booleano espresso con porte logiche e flip-flop tipo D in uno
+pseudolinguaggio analogo a Verilog. È possibile simulare questo circuito
+con dati d'ingresso forniti dall'utente, oppure eseguire semplici
+analisi simboliche sullo stesso (path minimo/massimo e coni logici).
+
+A livello teorico il sistema presenta molti pattern riconducibili a
+soluzioni canoniche, delineate di seguito:
+
+\begin{itemize}
+\item
+  La lettura del file è implementata con un lexer rudimentale e una
+  macchina a stati;
+\item
+  Il parsing delle espressioni è implementato con l'algoritmo shunting
+  yard;
+\item
+  L'esecuzione concreta e simbolica è implementata con una stack
+  machine.
+\end{itemize}
+
+L'implementazione fa ampio uso di costrutti del C++ moderno quando
+possibile con l'obiettivo di modellizzare facilmente il dominio e di
+avere buone prestazioni mantenendo una buona espressività. In
+particolare il modello attua una netta separazione tra dati sintattici
+\texttt{namespace\ ast}, di esecuzione concreta (\texttt{simulation}) e
+di analisi (\texttt{analysis}).
+
+\section{Parsing del file (\texttt{FileParser})}
+
+Come accennato nell'abstract, il primo stadio è un problema standard di
+parsing, e in quanto tale presenta soluzioni canoniche.
+L'implementazione inizia con una lettura riga per riga
+(\texttt{FileParser::FileParser(std::istream\ \&)}) seguita da un lexer
+rudimentale
+(\texttt{vector\textless{}string\textgreater{}\ FileParser::tokenize(string)})
+che divide i token in base al whitespace e aggiunge un token
+``newline''. Il parsing è gestito da una macchina a stati finiti: la
+classe \texttt{FileParser} presenta la struttura tipica di una FSM, più
+alcuni membri necessari al parsing di oggetti complessi e alcune
+funzioni helper.
+
+Le assegnazioni vengono poi ordinate topologicamente al fine di
+risolvere già in questa fase i problemi di dipendenze e quindi non
+aggiungere complessità alla stack machine.
+
+Le uniche strutture dati di interesse sono le hashmap
+(\texttt{unordered\_map}) utilizzate per la risoluzione dei nomi delle
+variabili (input, output, flip-flop): vista la frequenza con cui viene
+svolta quest'operazione e nell'ipotesi di un numero non triviale di
+variabili, si è valutato che fosse opportuno usare queste strutture dati
+ausiliarie per ridurre il costo della risoluzione a \(O(1)\) (anziché
+l'\(O(n)\) di una ricerca lineare), a costo di introdurre un po' di
+complessità nel codice. Le strutture dati usate per rappresentare il
+circuito verranno trattate più tardi nella relazione.
+
+Si riporta la complessità dei principali metodi:
+
+\begin{itemize}
+\item
+  \texttt{ast::tokenize(const\ string\ \&line)}: \(O(n)\) nel numero di
+  caratteri
+\item
+  \texttt{ingest(const\ string\ \&token)}:
+
+  \begin{itemize}
+  \item
+    \(O(1)\) in quasi tutti gli stati;
+  \item
+    durante il parsing di espressioni, \(O(1)\) ammortizzato (si veda il
+    relativo capitolo).
+  \end{itemize}
+\item
+  \texttt{ingest\_newline()}:
+
+  \begin{itemize}
+  \item
+    \(O(1)\) di default;
+  \item
+    alla fine di un'assegnazione, la complessità di
+    \texttt{ExpressionParser::finalize} più quella di \texttt{compile}.
+  \end{itemize}
+\item
+  \texttt{compile(const\ deque\textless{}string\textgreater{}\ assignment)}:
+  \(O(n)\) nel numero di variabili dell'assegnazione
+\item
+  \texttt{finalize()}, \texttt{toposort\_assignments()}:
+  \(O(|V| + |E|)\) (Kahn)
+\end{itemize}
+
+Si verifica dunque che il parsing avviene in tempo \textbf{lineare} nel
+numero di token.
+
+L'ordinamento topologico è stato implementato con l'algoritmo di Kahn,
+che è noto essere lineare nel numero di nodi e di lati
+(\(O(|V| + |E|)\)). Le strutture dati usate (\texttt{vector},
+\texttt{unordered\_set}) sono average-case \(O(1)\), quindi non
+inficiano questa qualità; lo stesso si può dire della fase di
+preprocessing dei coni logici, che è lineare nel numero di nodi e lati.
+Considerato che ciascun nodo rappresenta un'espressione e ciascun lato è
+definito da un token, anche l'ordinamento topologico è \textbf{lineare}
+nel numero di token.
+
+\section{Parsing delle espressioni (\texttt{ExpressionParser})}
+
+È invece più elaborato il problema della lettura delle espressioni: come
+è noto, un linguaggio con parentesi bilanciate non è regolare, dunque
+non può essere parsato da una macchina a stati. In questo caso la
+soluzione canonica è l'algoritmo shunting yard, di complessità \(O(n)\):
+esso processa ciascun token un numero costante di volte (1 push per gli
+operandi, 1 push + 1 pop per gli operatori), e le operazioni di push/pop
+su uno stack sono \(O(1)\).
+
+Una scelta di progettazione che si rivelerà utile successivamente è
+quella di usare strutture dati ``implementation-agnostic'', compatibili
+sia con l'esecuzione concreta sia con quella simbolica. Per questo
+motivo gli operatori sono rappresentati non come puntatori a funzione
+(\texttt{std::function}) come sarebbe immediato pensare in un'ottica di
+esecuzione concreta, ma con offset in un array ideale di operatori:
+concretamente ciò vuol dire che ad esempio l'operatore NOT è
+rappresentato da 0, AND da 1, e così via. Analogamente gli operandi sono
+offset nell'array di riferimento (array delle variabili di input, delle
+variabili di output, o dei flip-flop), questa volta per necessità legate
+al disaccoppiamento tra il circuito parsato e i valori effettivi delle
+variabili. Il risultato è ancora una volta canonico, ed è noto come
+``abstract syntax tree'' - un concetto universalmente usato nei parser.
+Nell'implementazione quanto sopra si ritrova in
+\texttt{ast::Input}/\texttt{Output}/\texttt{Flipflop}, che sono semplici
+wrapper di un \texttt{size\_t\ offset}, e in \texttt{ast::Operator}, che
+è una case class.
+
+\section{Implementazione generica (\texttt{GenericSimulator})}
+
+Una valutazione preliminare delle funzionalità di analisi richieste dal
+problema mostra che queste possono essere espresse in termini di
+esecuzione simbolica: a grandi linee è sufficiente che ogni ``valore di
+verità'' rappresenti in realtà un nodo e i relativi figli, e che ogni
+operatore o flip-flop crei semplicemente un nuovo nodo avente per figli
+gli input dell'operatore o flip-flop. Si ottiene così un tree, dove è
+semplice individuare path minimo e massimo e coni logici. Si è valutato
+dunque di genericizzare l'implementazione rispetto al tipo \texttt{T}
+che rappresenta i valori di verità al fine di riutilizzare una buona
+quantità di codice tra la funzionalità di simulazione e quella di
+analisi.
+
+L'uso dell'algoritmo shunting yard suggerisce immediatamente l'uso di
+una stack machine per l'esecuzione degli assignment, struttura che
+peraltro eccelle nella semplicità di implementazione. L'implementazione
+generica ricalca pertanto una stack machine tradizionale, rappresentando
+l'input in forma RPN con uno stack e mantenendo internamente uno stack
+di operandi. Ciascun operatore si limita a poppare gli operandi
+necessari, valutare la propria funzione e pushare il risultato, pertanto
+la sua esecuzione è \(O(1)\) e la complessità dell'esecuzione è lineare
+nel numero di token: dati \(m\) assignment con \(n_i\) token ciascuno,
+la complessità è \(O(\sum_i^m n_i)\).
+
+Si riporta per completezza la complessità dei principali metodi (con
+l'ipotesi di operatori \(O(1)\)):
+
+\begin{itemize}
+\item
+  \texttt{StackMachine::evaluate(...)}: \(O(n)\) nel numero di token
+\item
+  \texttt{Circuit::evaluate(const\ vector\textless{}T\textgreater{}\ \&inputs)}:
+  \(O(n)\) nel numero di espressioni
+\end{itemize}
+
+L'esecuzione è quindi \textbf{lineare} nel numero di token.
+
+\section{Esecuzione concreta (\texttt{namespace\ simulation})}
+
+Si osserva che non è possibile usare dei semplici bool in virtù della
+presenza dello stato ``x'' per i flip-flop non inizializzati.
+L'esecuzione fa quindi uso di una \texttt{enum\ class\ TruthValue} con
+l'override dei relativi operatori booleani, specializzando
+l'implementazione generica descritta sopra. Non vi sono altrimenti
+problematiche di nota: la complessità del progetto è interamente gestita
+da \texttt{GenericSimulator}, ed è sufficiente esporre gli operatori
+tramite
+\texttt{Implementation::on\_operator(ast::Operator,\ Engine::OperandStack)}.
+Essendo gli operatori implementati in tempo costante i calcoli di
+complessità sono invariati (\textbf{lineare} nel numero di token).
+
+Per quanto riguarda le specifiche si è scelto di richiedere i file di
+input e output da tastiera per coerenza di UX con il menu iniziale, e di
+stampare i risultati come una semplice sequenza di caratteri separati da
+newline con il fine di massimizzare l'interoperabilità del simulatore
+specie con shell tools.
+
+\section{Esecuzione simbolica (\texttt{namespace\ analysis})}
+
+Come accennato nella premessa all'implementazione generica, le
+funzionalità di analisi richieste possono essere espresse in termini di
+esecuzione simbolica. Se \texttt{T} rappresenta non un valore di verità
+ma un token con i relativi figli, l'implementazione degli operatori si
+riduce al costruire nodi unari o binari, e il risultato finale è un tree
+per ciascun bit di output. Ricordando che i problemi di dipendenze sono
+già stati risolti in fase di parsing con l'ordinamento topologicamento
+possiamo dunque fare una semplice depth-first traversal del tree
+corrispondente a ciascun output per calcolare coni logici, shortest path
+e longest path.
+
+Dal punto di vista dell'implementazione si osserva che il ruolo
+dell'esecuzione simbolica è nei fatti la conversione di un'espressione
+da vettore in forma RPN a tree. Viene spontaneo chiedersi perché
+l'espressione non sia stata costruita come tree già in fase di parsing,
+una modifica che richiederebbe una versione leggermente diversa dello
+shunting-yard algorithm: la risposta è che questa modifica porterebbe a
+una duplicazione del codice di diverse parti (parser, topological
+sorting) che per vari motivi si presta poco alla deduplicazione con
+template code. L'approccio di conversione da RPN a tree unifica invece
+alcune parti (parser) e fa buon uso dei template per altri (topological
+sorting).
+
+A livello di data structure osserviamo che i figli sono implementati
+come puntatori a nodi all'interno di una \texttt{forward\_list}: tra i
+container STL solo \texttt{list} e \texttt{forward\_list} sono adatti
+allo scopo, perché per loro natura non invalidano mai i puntatori
+esistenti durante l'inserzione di un nuovo elemento. Per la visita del
+tree il path viene invece immagazzinato in una \texttt{deque}, che ha la
+funzionalità di stack richiesta da DFS ma espone anche un iteratore che
+permette la conversione in \texttt{vector}.
+
+In termini di complessità verifichiamo che gli operatori sono
+implementati in tempo costante: ogni operando viene poppato dallo stack
+(\(O(1)\)) e pushato sulla linked list (\(O(1)\)). Valgono quindi le
+considerazioni fatte relativamente all'implementazione generica, e la
+fase di esecuzione simbolica è \textbf{lineare} nel numero di token.
+Analizziamo invece il tree traversal:
+
+\begin{itemize}
+\item
+  Viene effettuata una depth-first search (si noti l'uso di
+  \texttt{logic\_cones} per evitare le visite ridondanti), che è lineare
+  nel numero di token.
+\item
+  Durante la visita di ciascun token, la gerarchia viene immagazzinata
+  nelle deque \texttt{current\_path} e
+  \texttt{current\_lvalue\_hierarchy}, con un costo \(O(1)\). Il token è
+  poi processato, con complessità diverse in base al tipo:
+
+  \begin{itemize}
+  \item
+    Se è un input, questo viene inserito nel cono logico di ciascun
+    elemento nella gerarchia della visita: essendo la gerarchia lunga al
+    più \(n\), essendo il lookup nella mappa di coni logici \(O(1)\)
+    average case, ed essendo il costo dell'inserimento in un cono logico
+    \(O(\log n)\), la complessità è \(O(n \log n)\). La lunghezza del
+    path è poi comparata con il path noto più corto e più lungo, in
+    tempo costante.
+  \item
+    Se è un flip-flop, questo viene ricercato nella ``cache'' di coni
+    logici già calcolati, con un lookup \(O(1)\). Se la ricerca va a
+    buon fine viene effettuato il merge di questo cono logico per
+    ciascuno degli \(n\) coni logici della gerarchia, con complessità
+    \(O(n^2 \log(n+m)) = O(n^2 \log n)\) (dove \(m \sim n\) è la
+    dimensione del cono logico trovato, ed \(n\) è come sempre il numero
+    complessivo di token); se la ricerca non va a buon fine vengono
+    visitati i figli del flip-flop. La complessità è quindi
+    \(O(n^2 \log n)\).
+  \item
+    Se è un operatore, ne vengono visitati i figli: \(O(1)\).
+  \end{itemize}
+\end{itemize}
+
+Ricordando che quanto sopra è il costo per il singolo token, otteniamo
+che la complessità nel caso peggiore è \(O(n^3 \log n)\), quindi
+\textbf{cubica} nel numero di token. Questo pessimo risultato si ottiene
+con l'ipotesi che la lunghezza media della gerarchia sia lineare nel
+numero di token, il che corrisponde a un circuito molto ``sbilanciato''
+(albero stretto e profondo); nell'ipotesi di un circuito più bilanciato
+la lunghezza della gerarchia tende invece verso \(\log n\), portando il
+costo dell'analisi a \(O(n \log^2 n)\).
+
+Sarebbe inoltre possibile evitare lo step \(n^2 \log n\) descritto sopra
+affiancando a ciascun cono logico un vettore di coni ``children'',
+costruendo quindi un grafo di coni logici di cui fare il traversal al
+momento della stampa. La complessità di una singola stampa sarebbe
+quindi \(O(n \log n)\), essendoci al più \(n\) children contenenti \(n\)
+elementi ciascuno, e la complessità della stampa di tutti i coni
+\(O(n^2 \log n)\), un netto miglioramento rispetto all'\(O(n^3 \log n)\)
+attuale. Si è valutato di non compiere questa scelta di progetto per non
+aggiungere ulteriore ``carico cognitivo'' ad \texttt{analysis.cpp},
+limitandosi invece a documentare questo spunto nella relazione.
+
+La stampa è semplicemente \(O(n)\) nel numero di output.
+
+Si riporta per completezza la complessità dei principali metodi:
+
+\begin{itemize}
+\item
+  \texttt{Implementation::on\_operator(ast::Operator,\ Engine::OperandStack)}:
+  \(O(1)\)
+\item
+  \texttt{GraphWalker::process(Token)}: \(O(n^2 \log n)\) (vedi sopra)
+\item
+  \texttt{GraphWalker::walk(const\ Node\&)}: \(O(1)\) più la complessità
+  di \texttt{GraphWalker::process}
+\item
+  \texttt{GraphWalker::walk\_output(ast::Output)}: \(O(1)\) più la
+  complessità di \texttt{GraphWalker::process}
+\item
+  \texttt{Path::toString(const\ ast::Module\&)}: \(O(n)\) nel numero di
+  token
+\item
+  \texttt{run(const\ ast::Module\&)}: \(O(n^3 \log n)\) nel numero di
+  token del circuito
+\end{itemize}
+\end{document}
